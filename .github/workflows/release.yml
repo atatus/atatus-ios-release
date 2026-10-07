@@ -3,13 +3,27 @@
 # This file belongs in that repository, not in the private source repository it is stored in. See
 # RELEASE_SETUP.md for how it gets there.
 #
-# It is dispatched by the private repository's Bitbucket tag pipeline, clones the private source at
-# that tag, builds the XCFrameworks, and publishes them to this repository's releases and to
-# CocoaPods Trunk. The private source is never committed here.
+# Releases are fully automatic and need nothing from Bitbucket but the tag:
+#
+#   - `detect` runs on a schedule. It lists the `vX.Y.Z` tags of the private Bitbucket repository
+#     and dispatches this workflow for the oldest one that has no GitHub release yet.
+#   - `release` runs on that dispatch, or on a manual "Run workflow" with a version. It clones the
+#     private source at the tag, builds the XCFrameworks, and publishes them to this repository's
+#     releases and to CocoaPods Trunk. The private source is never committed here.
+#
+# Bitbucket cannot notify GitHub itself, so polling is what turns a pushed tag into a release.
 
 name: Release
 
+# Scheduled runs only look for tags; each release is a run of its own, named after its version, so
+# `detect` can tell from the run history which versions were already attempted.
+run-name: ${{ github.event_name == 'schedule' && 'Detect release tags' || format('Release {0}', inputs.version) }}
+
 on:
+  schedule:
+    # GitHub may start scheduled runs late under load, so a release begins roughly 15-30 minutes
+    # after its tag is pushed.
+    - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
       version:
@@ -17,12 +31,11 @@ on:
         type: string
         required: true
 
-# Only what the job needs: committing the generated Package.swift and creating the release.
-permissions:
-  contents: write
+# Each job declares the little it needs.
+permissions: {}
 
 concurrency:
-  group: release-${{ inputs.version }}
+  group: ${{ github.event_name == 'schedule' && 'release-detect' || format('release-{0}', inputs.version) }}
   cancel-in-progress: false
 
 env:
@@ -32,9 +45,98 @@ env:
   VENDORED_FRAMEWORKS: OpenTelemetryApi
 
 jobs:
+  detect:
+    name: Detect release tags
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # Dispatch this workflow and read its run history.
+      actions: write
+      # Read the existing releases.
+      contents: read
+    steps:
+      - name: Dispatch the next unreleased tag
+        env:
+          BITBUCKET_APP_PASSWORD: ${{ secrets.BITBUCKET_APP_PASSWORD }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          WORKFLOW_FILE: release.yml
+        run: |
+          set -euo pipefail
+
+          if [ -z "${BITBUCKET_APP_PASSWORD:-}" ]; then
+            echo "::error::BITBUCKET_APP_PASSWORD must be set as a repository secret."
+            exit 1
+          fi
+
+          # Same credential handling as the clone in the release job: the token never lands in a
+          # url, `.git/config` or the log.
+          cat > "$RUNNER_TEMP/git-askpass.sh" <<'ASKPASS'
+          #!/bin/sh
+          case "$1" in
+            Username*) printf '%s' "x-token-auth" ;;
+            Password*) printf '%s' "$BITBUCKET_APP_PASSWORD" ;;
+          esac
+          ASKPASS
+          chmod 700 "$RUNNER_TEMP/git-askpass.sh"
+
+          refs="$(GIT_ASKPASS="$RUNNER_TEMP/git-askpass.sh" GIT_TERMINAL_PROMPT=0 \
+            git ls-remote --tags --refs "https://bitbucket.org/${BITBUCKET_REPOSITORY}.git")"
+          rm -f "$RUNNER_TEMP/git-askpass.sh"
+
+          # Production tags only, oldest first, so versions are released in order.
+          tags="$(printf '%s\n' "$refs" | awk '{ sub("^refs/tags/", "", $2); print $2 }' \
+            | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sort -V)"
+          if [ -z "$tags" ]; then
+            echo "No vX.Y.Z tags in ${BITBUCKET_REPOSITORY}."
+            exit 0
+          fi
+
+          released="$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" --jq '.[].tag_name')"
+
+          # Release runs are named "Release <tag>" (see `run-name`), whether this job or a person
+          # dispatched them.
+          runs="$(gh api --paginate \
+            "repos/$GH_REPO/actions/workflows/$WORKFLOW_FILE/runs?event=workflow_dispatch&per_page=100" \
+            --jq '.workflow_runs[] | [.display_title, .status, (.conclusion // "")] | @tsv')"
+
+          # One release at a time: CocoaPods resolves each version's dependencies from its CDN, so
+          # concurrent releases would race each other.
+          active="$(printf '%s\n' "$runs" | awk -F '\t' '$1 ~ /^Release v/ && $2 != "completed" { print $1 }')"
+          if [ -n "$active" ]; then
+            echo "A release is in progress ($(printf '%s\n' "$active" | paste -sd ',' -)); nothing to dispatch."
+            exit 0
+          fi
+
+          for tag in $tags; do
+            if printf '%s\n' "$released" | grep -qxF "$tag"; then
+              continue
+            fi
+
+            # A tag whose release run failed before creating the GitHub release is not retried
+            # automatically: the failure needs a fix, and retrying would only repeat it every 15
+            # minutes on a macOS runner.
+            previous="$(printf '%s\n' "$runs" | awk -F '\t' -v t="Release $tag" '$1 == t { print $3; exit }')"
+            if [ -n "$previous" ]; then
+              echo "::warning::$tag has no GitHub release, and its last release run ended '$previous'. It is not retried automatically: fix the cause, then run this workflow manually with version $tag."
+              continue
+            fi
+
+            echo "Dispatching the release of $tag."
+            gh workflow run "$WORKFLOW_FILE" --ref "$GITHUB_REF_NAME" -f version="$tag"
+            exit 0
+          done
+
+          echo "No tag is waiting for a release; nothing to dispatch."
+
   release:
     name: Release ${{ inputs.version }}
+    if: github.event_name == 'workflow_dispatch'
     runs-on: macos-15
+    # Only what the job needs: committing the generated Package.swift and creating the release.
+    permissions:
+      contents: write
     steps:
       - name: Checkout the distribution repository
         uses: actions/checkout@v5
