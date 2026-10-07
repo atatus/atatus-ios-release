@@ -292,6 +292,10 @@ jobs:
           if ! command -v xcbeautify &> /dev/null; then
             brew install xcbeautify || true
           fi
+          # `build-xcframeworks.sh` builds the bundled OpenTelemetryApi framework with Carthage.
+          if ! command -v carthage &> /dev/null; then
+            brew install carthage
+          fi
           if [ -f Gemfile ]; then
             bundle install
           fi
@@ -304,10 +308,14 @@ jobs:
           ./scripts/build.sh
           ./scripts/test.sh
 
+      # Built from `source/`, the clone of the private repository at the tag. `build.sh` leaves the
+      # arm64e-free bundle in `artifacts/Atatus.xcframework`, which the steps below validate and package.
+      #
+      # `build-xcframeworks.sh` (called by `build.sh`) starts with `git clean -fxd` in `source/`, which is
+      # why this runs after the tests.
       - name: Build XCFrameworks
         working-directory: source
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.version.outputs.tag }}
         run: |
           set -euo pipefail
@@ -362,10 +370,20 @@ jobs:
               echo "::error::$name has no device slice (slices: $identifiers)."
               problems=$((problems + 1))
             fi
-            if grep -q "arm64e" <<< "$identifiers"; then
-              echo "::error::$name still contains an arm64e slice (slices: $identifiers)."
-              problems=$((problems + 1))
-            fi
+            # Checked on the binaries, not the slice names: `remove-arm64e-from-xcframework.sh` strips
+            # the architecture from each binary but leaves identifiers such as `ios-arm64_arm64e` as
+            # they are.
+            while IFS=$'\t' read -r identifier library_path; do
+              binary="$framework/$identifier/$library_path/${library_path%.framework}"
+              if [ ! -f "$binary" ]; then
+                echo "::error::$name has no binary at $identifier/$library_path."
+                problems=$((problems + 1))
+              elif lipo -archs "$binary" | tr ' ' '\n' | grep -qx "arm64e"; then
+                echo "::error::$name still contains arm64e in $identifier ($(lipo -archs "$binary"))."
+                problems=$((problems + 1))
+              fi
+            done < <(plutil -extract AvailableLibraries json -o - "$plist" \
+              | python3 -c 'import json,sys; [print(l["LibraryIdentifier"] + "\t" + l["LibraryPath"]) for l in json.load(sys.stdin)]')
 
             echo "$name: $identifiers"
           done
@@ -414,10 +432,109 @@ jobs:
             --repository "${GITHUB_REPOSITORY}" \
             --output-path "artifacts/release/podspecs"
 
-      # The release is created before the pods are validated, because a binary podspec's `:http`
-      # source must be downloadable for `pod spec lint` to resolve it. That ordering is deliberate: a
-      # GitHub release can be deleted if validation then fails, whereas a CocoaPods version can never
-      # be withdrawn. The irreversible step stays last.
+      # Every pod is linted before anything is published, against the archives this run just built,
+      # without fetching anything from this repository (it is private, so CocoaPods could not).
+      #
+      # `pod lib lint` builds a pod from the directory its podspec sits in, so each pod is linted in a
+      # directory holding only what its own release archive unpacks to: exactly what `pod install`
+      # gives a consumer. The Atatus pods it depends on come from `--include-podspecs`, using copies
+      # of the generated podspecs whose only difference is the `:http` url, rewritten to a loopback
+      # server holding the same archives. The podspecs pushed to Trunk are not modified.
+      #
+      # `pod spec lint` cannot do this: it has no `--include-podspecs`, so a pod's dependencies on
+      # sibling pods of the same, unpublished version could only resolve from Trunk.
+      - name: Validate all podspecs against the built artifacts
+        working-directory: source
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          release_dir="$PWD/artifacts/release"
+          lint_dir="$RUNNER_TEMP/podspec-lint"
+          rm -rf "$lint_dir"
+          mkdir -p "$lint_dir/specs" "$lint_dir/pods"
+
+          # Port 0 lets the OS pick a free port; `-u` so the line announcing it is not buffered.
+          server_log="$RUNNER_TEMP/podspec-lint-server.log"
+          python3 -u -m http.server 0 --bind 127.0.0.1 --directory "$release_dir" > "$server_log" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+
+          port=""
+          for _ in $(seq 1 50); do
+            port="$(sed -nE 's/.* port ([0-9]+).*/\1/p' "$server_log" | head -n 1)"
+            [ -n "$port" ] && break
+            sleep 0.2
+          done
+          if [ -z "$port" ]; then
+            echo "::error::The local artifact server did not start."
+            cat "$server_log"
+            exit 1
+          fi
+
+          published_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+          local_url="http://127.0.0.1:${port}"
+
+          for spec in "$release_dir"/podspecs/*.podspec; do
+            file="$(basename "$spec")"
+            name="${file%.podspec}"
+            # Fails loudly if the generator ever stops using the release url, rather than linting a
+            # podspec that points somewhere else.
+            archive="$(sed -nE 's|.*:http => "'"${published_url}"'/([^"]+)".*|\1|p' "$spec")"
+            if [ -z "$archive" ]; then
+              echo "::error::$file does not download from ${published_url}; cannot lint it locally."
+              exit 1
+            fi
+            if [ ! -f "$release_dir/$archive" ]; then
+              echo "::error::$file downloads '$archive', which this run did not build."
+              exit 1
+            fi
+            sed "s|${published_url}/|${local_url}/|g" "$spec" > "$lint_dir/specs/$file"
+
+            mkdir -p "$lint_dir/pods/$name"
+            cp "$lint_dir/specs/$file" "$lint_dir/pods/$name/"
+            unzip -q "$release_dir/$archive" -d "$lint_dir/pods/$name"
+          done
+
+          # The Gemfile pins the CocoaPods version used to publish, so lint runs with the same one.
+          export BUNDLE_GEMFILE="$PWD/Gemfile"
+
+          FAILED_SPECS=()
+          for pod_dir in "$lint_dir"/pods/*; do
+            name="$(basename "$pod_dir")"
+            # Only the Atatus pods this one depends on, transitively: `--include-podspecs` resolves
+            # every podspec it is given, so unrelated pods would drag in their own dependencies.
+            mkdir -p "$pod_dir/.deps"
+            pending=("$name")
+            while [ "${#pending[@]}" -gt 0 ]; do
+              current="${pending[0]}"
+              pending=("${pending[@]:1}")
+              while read -r dep; do
+                if [ "$dep" != "$name" ] && [ ! -f "$pod_dir/.deps/$dep.podspec" ] && [ -f "$lint_dir/specs/$dep.podspec" ]; then
+                  cp "$lint_dir/specs/$dep.podspec" "$pod_dir/.deps/"
+                  pending+=("$dep")
+                fi
+              done < <(sed -nE 's/^[[:space:]]*s\.dependency "(Atatus[A-Za-z]*)".*/\1/p' "$lint_dir/specs/$current.podspec")
+            done
+
+            echo "::group::pod lib lint $name.podspec"
+            if (cd "$pod_dir" && bundle exec pod lib lint "$name.podspec" --allow-warnings --include-podspecs='.deps/*.podspec'); then
+              echo "✓ $name.podspec passed validation."
+            else
+              echo "::error::$name.podspec failed validation."
+              FAILED_SPECS+=("$name.podspec")
+            fi
+            echo "::endgroup::"
+          done
+
+          if [ "${#FAILED_SPECS[@]}" -gt 0 ]; then
+            echo "::error::${#FAILED_SPECS[@]} podspec(s) failed validation: ${FAILED_SPECS[*]}. Nothing has been published."
+            exit 1
+          fi
+
+          echo "All podspecs validated against the built artifacts."
+
       - name: Create the GitHub release and upload artifacts
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -455,42 +572,15 @@ jobs:
             gh release create "$TAG" --title "$VERSION" --notes-file "$notes"
           fi
 
+          # `*.cocoapods.zip` are the archives only CocoaPods downloads (see
+          # `generate-binary-podspecs.sh`); `checksums.txt` lists the SwiftPM archives alone.
           gh release upload "$TAG" \
             source/artifacts/release/*.xcframework.zip \
+            source/artifacts/release/*.cocoapods.zip \
             source/artifacts/release/checksums.txt \
             --clobber
 
           echo "Assets uploaded to $TAG."
-
-      - name: Validate all podspecs against the published artifacts
-        working-directory: source
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          set -euo pipefail
-
-          # Every pod is linted against the urls consumers will use, never a local path, so a lint
-          # pass means a clean `pod install` can actually fetch the binary.
-          cd artifacts/release/podspecs
-
-          FAILED_SPECS=()
-          for spec in *.podspec; do
-            echo "::group::pod spec lint $spec"
-            if bundle exec pod spec lint "$spec" --allow-warnings --include-podspecs='*.podspec'; then
-              echo "✓ $spec passed validation."
-            else
-              echo "::error::$spec failed validation."
-              FAILED_SPECS+=("$spec")
-            fi
-            echo "::endgroup::"
-          done
-
-          if [ "${#FAILED_SPECS[@]}" -gt 0 ]; then
-            echo "::error::${#FAILED_SPECS[@]} podspec(s) failed validation: ${FAILED_SPECS[*]}. No pod has been published; delete release $VERSION before retrying."
-            exit 1
-          fi
-
-          echo "All podspecs validated against the published artifacts."
 
       - name: Publish to CocoaPods Trunk
         working-directory: source
