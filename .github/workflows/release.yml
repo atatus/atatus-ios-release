@@ -1,0 +1,545 @@
+# Release workflow for the PUBLIC Atatus iOS distribution repository (atatus/atatus-ios-release).
+#
+# This file belongs in that repository, not in the private source repository it is stored in. See
+# RELEASE_SETUP.md for how it gets there.
+#
+# It is dispatched by the private repository's Bitbucket tag pipeline, clones the private source at
+# that tag, builds the XCFrameworks, and publishes them to this repository's releases and to
+# CocoaPods Trunk. The private source is never committed here.
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag from the private repository, e.g. v1.0.0"
+        type: string
+        required: true
+
+# Only what the job needs: committing the generated Package.swift and creating the release.
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  # The private source repository the release is built from.
+  BITBUCKET_REPOSITORY: atatus/atatus-ios-agent
+  # Frameworks that are bundled but are not products: consumers get them transitively.
+  VENDORED_FRAMEWORKS: OpenTelemetryApi
+
+jobs:
+  release:
+    name: Release ${{ inputs.version }}
+    runs-on: macos-15
+    steps:
+      - name: Checkout the distribution repository
+        uses: actions/checkout@v5
+
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.version }}"
+
+          # One version source: the tag from the private repository. Everything downstream - the
+          # GitHub release, the SwiftPM manifest, every podspec - is derived from it, so they cannot
+          # disagree.
+          if [[ ! "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "::error::'$TAG' is not a production release tag (expected vX.Y.Z)."
+            exit 1
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+          echo "Releasing ${BASH_REMATCH[1]} from $TAG"
+
+      - name: Refuse to overwrite an existing release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          # A published version must never come to mean a different binary. If the release already
+          # has assets, stop: re-running is only safe before anything was uploaded.
+          if gh release view "$TAG" --json assets --jq '.assets | length' > /tmp/asset_count 2>/dev/null; then
+            count="$(cat /tmp/asset_count)"
+            if [ "$count" -gt 0 ]; then
+              echo "::error::Release $TAG already exists with $count asset(s). Publishing again would replace binaries that consumers may already have resolved. Delete the release deliberately if you intend to rebuild it."
+              exit 1
+            fi
+            echo "Release $TAG exists but has no assets; continuing."
+          else
+            echo "No existing release for $TAG."
+          fi
+
+      - name: Clone the private source at the tag
+        env:
+          BITBUCKET_APP_PASSWORD: ${{ secrets.BITBUCKET_APP_PASSWORD }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${BITBUCKET_APP_PASSWORD:-}" ]; then
+            echo "::error::BITBUCKET_APP_PASSWORD must be set as a repository secret."
+            exit 1
+          fi
+
+          # The token goes in a git credential helper rather than the remote url, so it never
+          # lands in `.git/config`, in the log, or in any later `git remote -v`. Bitbucket
+          # repository access tokens authenticate as the fixed username `x-token-auth`.
+          cat > "$RUNNER_TEMP/git-askpass.sh" <<'ASKPASS'
+          #!/bin/sh
+          case "$1" in
+            Username*) printf '%s' "x-token-auth" ;;
+            Password*) printf '%s' "$BITBUCKET_APP_PASSWORD" ;;
+          esac
+          ASKPASS
+          chmod 700 "$RUNNER_TEMP/git-askpass.sh"
+
+          GIT_ASKPASS="$RUNNER_TEMP/git-askpass.sh" GIT_TERMINAL_PROMPT=0 \
+            git clone --depth 1 --branch "$TAG" \
+              "https://bitbucket.org/${BITBUCKET_REPOSITORY}.git" source
+
+          rm -f "$RUNNER_TEMP/git-askpass.sh"
+
+          # The clone must never become part of this public repository.
+          echo "source/" >> .git/info/exclude
+
+          echo "Cloned ${BITBUCKET_REPOSITORY} at $TAG"
+          git -C source log --oneline -1
+
+      - name: Verify the source version matches the tag
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd source
+
+          # The tag is authoritative, but a mismatch means the tagged commit was never bumped, which
+          # would publish artifacts whose reported version disagrees with their package version.
+          sdk_version="$(grep '__sdkVersion' AtatusCore/Sources/Versioning.swift | awk -F '"' '{print $2}')"
+          if [ "$sdk_version" != "$VERSION" ]; then
+            echo "::error::__sdkVersion is '$sdk_version' but the tag says '$VERSION'."
+            exit 1
+          fi
+
+          problems=0
+          for spec in *.podspec; do
+            spec_version="$(grep -E '^[[:space:]]*s\.version' "$spec" | awk -F '"' '{print $2}')"
+            if [ "$spec_version" != "$VERSION" ]; then
+              echo "::error::$spec is at '$spec_version', expected '$VERSION'."
+              problems=$((problems + 1))
+            fi
+          done
+          [ "$problems" -eq 0 ] || exit 1
+
+          echo "Source, podspecs and tag all agree on $VERSION."
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Setup simulator runtimes
+        run: |
+          set -euo pipefail
+
+          # A platform can only be built for when its simulator *runtime* is installed, which is a
+          # separate download from the SDK. Without it `pod lib lint` fails with "Could not find a
+          # `tvos` simulator", which reads as a source error.
+          for platform in iOS tvOS; do
+            runtimes="$(xcrun simctl list runtimes)"
+            if grep -q "^${platform} " <<< "$runtimes"; then
+              echo "$platform runtime present"
+              continue
+            fi
+            echo "Downloading the $platform platform"
+            sudo xcodebuild -downloadPlatform "$platform"
+            runtimes="$(xcrun simctl list runtimes)"
+            if ! grep -q "^${platform} " <<< "$runtimes"; then
+              echo "::error::CI environment: the $platform simulator runtime is unavailable after download. This is a runner problem, not a source failure."
+              exit 1
+            fi
+          done
+
+      - name: Toolchain diagnostics
+        run: |
+          set -euo pipefail
+          echo "::group::Versions"
+          xcodebuild -version
+          swift --version
+          echo "CocoaPods: $(pod --version)"
+          echo "::endgroup::"
+          echo "::group::SDKs"
+          xcodebuild -showsdks
+          echo "::endgroup::"
+          echo "::group::Simulator runtimes"
+          xcrun simctl list runtimes
+          echo "::endgroup::"
+
+      - name: Install build tooling
+        working-directory: source
+        run: |
+          set -euo pipefail
+          # Optional formatter; the build falls back to raw xcodebuild output without it.
+          if ! command -v xcbeautify &> /dev/null; then
+            brew install xcbeautify || true
+          fi
+          if [ -f Gemfile ]; then
+            bundle install
+          fi
+
+      - name: Build and test the package
+        working-directory: source
+        run: |
+          set -euo pipefail
+          ./scripts/validate_spm.sh
+          ./scripts/build.sh
+          ./scripts/test.sh
+
+      - name: Build XCFrameworks
+        working-directory: source
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          ./tools/release/build.sh --tag "$TAG" --artifacts-path "artifacts"
+
+      - name: Validate the XCFrameworks
+        working-directory: source
+        run: |
+          set -euo pipefail
+
+          # The arm64e-free bundle is what both channels ship: arm64e is not ABI-stable, so a
+          # consumer linking it would break on a future OS.
+          bundle_dir="artifacts/Atatus.xcframework"
+          if [ ! -d "$bundle_dir" ]; then
+            echo "::error::$bundle_dir was not produced by the build."
+            exit 1
+          fi
+
+          problems=0
+          for framework in "$bundle_dir"/*.xcframework; do
+            name="$(basename "$framework")"
+            plist="$framework/Info.plist"
+
+            if [ ! -f "$plist" ]; then
+              echo "::error::$name has no Info.plist; it is not a valid XCFramework."
+              problems=$((problems + 1))
+              continue
+            fi
+
+            # Every framework must carry a device slice and a simulator slice, or a consumer can
+            # build for only one of them.
+            identifiers="$(plutil -extract AvailableLibraries json -o - "$plist" \
+              | python3 -c 'import json,sys; print(" ".join(l["LibraryIdentifier"] for l in json.load(sys.stdin)))')"
+
+            # A slice is a device slice when its identifier does not end in `-simulator`. Matching
+            # architecture names instead would miss legitimate fat device slices such as
+            # `ios-arm64_arm64e`.
+            has_device=0
+            has_simulator=0
+            for identifier in $identifiers; do
+              case "$identifier" in
+                *-simulator) has_simulator=1 ;;
+                *) has_device=1 ;;
+              esac
+            done
+
+            if [ "$has_simulator" -eq 0 ]; then
+              echo "::error::$name has no simulator slice (slices: $identifiers)."
+              problems=$((problems + 1))
+            fi
+            if [ "$has_device" -eq 0 ]; then
+              echo "::error::$name has no device slice (slices: $identifiers)."
+              problems=$((problems + 1))
+            fi
+            if grep -q "arm64e" <<< "$identifiers"; then
+              echo "::error::$name still contains an arm64e slice (slices: $identifiers)."
+              problems=$((problems + 1))
+            fi
+
+            echo "$name: $identifiers"
+          done
+
+          [ "$problems" -eq 0 ] || exit 1
+          echo "All XCFrameworks carry device and simulator slices and no arm64e."
+
+      - name: Package per-framework archives and checksums
+        working-directory: source
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          ./tools/release/package-artifacts.sh \
+            --xcframeworks-path "artifacts/Atatus.xcframework" \
+            --output-path "artifacts/release" \
+            --version "$VERSION"
+
+      - name: Generate the SwiftPM manifest
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd source
+          ./tools/release/generate-spm-package.sh \
+            --checksums-file "artifacts/release/checksums.txt" \
+            --version "$VERSION" \
+            --repository "${GITHUB_REPOSITORY}" \
+            --output-file "$GITHUB_WORKSPACE/Package.swift"
+
+          cd "$GITHUB_WORKSPACE"
+          # Parses the manifest without resolving it: the urls only exist once the release is created.
+          swift package dump-package > /dev/null
+          echo "Package.swift is a valid manifest."
+          cat Package.swift
+
+      - name: Generate binary podspecs
+        working-directory: source
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          ./tools/release/generate-binary-podspecs.sh \
+            --checksums-file "artifacts/release/checksums.txt" \
+            --version "$VERSION" \
+            --repository "${GITHUB_REPOSITORY}" \
+            --output-path "artifacts/release/podspecs"
+
+      # The release is created before the pods are validated, because a binary podspec's `:http`
+      # source must be downloadable for `pod spec lint` to resolve it. That ordering is deliberate: a
+      # GitHub release can be deleted if validation then fails, whereas a CocoaPods version can never
+      # be withdrawn. The irreversible step stays last.
+      - name: Create the GitHub release and upload artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          notes="$RUNNER_TEMP/notes.md"
+          {
+            echo "Atatus SDK for iOS and tvOS $VERSION."
+            echo
+            echo "### Swift Package Manager"
+            echo
+            echo '```swift'
+            echo ".package(url: \"https://github.com/${GITHUB_REPOSITORY}.git\", exact: \"${VERSION}\")"
+            echo '```'
+            echo
+            echo "### CocoaPods"
+            echo
+            echo '```ruby'
+            echo "pod 'AtatusCore', '${VERSION}'"
+            echo '```'
+            echo
+            echo "### Checksums"
+            echo
+            echo '```'
+            cat source/artifacts/release/checksums.txt
+            echo '```'
+          } > "$notes"
+
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "Release $TAG exists; uploading assets to it."
+          else
+            gh release create "$TAG" --title "$VERSION" --notes-file "$notes"
+          fi
+
+          gh release upload "$TAG" \
+            source/artifacts/release/*.xcframework.zip \
+            source/artifacts/release/checksums.txt \
+            --clobber
+
+          echo "Assets uploaded to $TAG."
+
+      - name: Validate all podspecs against the published artifacts
+        working-directory: source
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          # Every pod is linted against the urls consumers will use, never a local path, so a lint
+          # pass means a clean `pod install` can actually fetch the binary.
+          cd artifacts/release/podspecs
+
+          FAILED_SPECS=()
+          for spec in *.podspec; do
+            echo "::group::pod spec lint $spec"
+            if bundle exec pod spec lint "$spec" --allow-warnings --include-podspecs='*.podspec'; then
+              echo "✓ $spec passed validation."
+            else
+              echo "::error::$spec failed validation."
+              FAILED_SPECS+=("$spec")
+            fi
+            echo "::endgroup::"
+          done
+
+          if [ "${#FAILED_SPECS[@]}" -gt 0 ]; then
+            echo "::error::${#FAILED_SPECS[@]} podspec(s) failed validation: ${FAILED_SPECS[*]}. No pod has been published; delete release $VERSION before retrying."
+            exit 1
+          fi
+
+          echo "All podspecs validated against the published artifacts."
+
+      - name: Publish to CocoaPods Trunk
+        working-directory: source
+        env:
+          COCOAPODS_TRUNK_TOKEN: ${{ secrets.COCOAPODS_TRUNK_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${COCOAPODS_TRUNK_TOKEN:-}" ]; then
+            echo "::error::COCOAPODS_TRUNK_TOKEN is not set."
+            exit 1
+          fi
+
+          cd artifacts/release/podspecs
+
+          # AtatusInternal first: every other pod depends on it, and Trunk resolves that dependency
+          # from its CDN index, which lags acceptance.
+          BASE_POD="AtatusInternal"
+
+          push_pod() {
+            local spec="$1" attempt=1 output
+            while :; do
+              if output="$(bundle exec pod trunk push "$spec" --allow-warnings 2>&1)"; then
+                echo "▸ $spec published."
+                return 0
+              fi
+              if printf '%s' "$output" | grep -qi "Unable to accept duplicate entry"; then
+                echo "▸ $spec is already published at this version. Skipping."
+                return 0
+              fi
+              if [ "$attempt" -ge 5 ]; then
+                echo "$output"
+                echo "::error::Failed to push $spec after 5 attempts."
+                return 1
+              fi
+              echo "▸ $spec push failed (attempt $attempt/5); retrying in 20s."
+              echo "$output"
+              attempt=$((attempt + 1))
+              sleep 20
+            done
+          }
+
+          wait_for_cdn() {
+            local pod="$1" version="$2" waited=0 md5 shard url
+            md5="$(printf '%s' "$pod" | md5 -q)"
+            shard="all_pods_versions_${md5:0:1}_${md5:1:1}_${md5:2:1}.txt"
+            url="https://cdn.cocoapods.org/$shard"
+            echo "Waiting for $pod/$version in $shard"
+            while [ "$waited" -lt 600 ]; do
+              if curl -fsSL "$url" 2>/dev/null | awk -F/ -v p="$pod" -v v="$version" '
+                   $1 == p { for (i = 2; i <= NF; i++) if ($i == v) found = 1 }
+                   END { exit(found ? 0 : 1) }'; then
+                echo "✓ $pod/$version indexed after ${waited}s."
+                return 0
+              fi
+              sleep 20
+              waited=$((waited + 20))
+            done
+            echo "::error::CocoaPods CDN propagation did not complete in 600s for $pod/$version. Trunk accepted it but its index has not regenerated, so dependent pods cannot validate. Re-run this job; nothing needs republishing."
+            return 1
+          }
+
+          echo "::group::Publish $BASE_POD"
+          push_pod "$BASE_POD.podspec"
+          echo "::endgroup::"
+
+          echo "::group::Wait for $BASE_POD CDN readiness"
+          wait_for_cdn "$BASE_POD" "$VERSION"
+          echo "::endgroup::"
+
+          FAILED_PODS=()
+          for spec in *.podspec; do
+            [ "$spec" = "$BASE_POD.podspec" ] && continue
+            echo "::group::Publish $spec"
+            push_pod "$spec" || FAILED_PODS+=("$spec")
+            echo "::endgroup::"
+          done
+
+          if [ "${#FAILED_PODS[@]}" -gt 0 ]; then
+            echo "::error::Partial release: ${#FAILED_PODS[@]} pod(s) failed to publish: ${FAILED_PODS[*]}. The pods published by this run remain published and cannot be withdrawn; re-running skips them."
+            exit 1
+          fi
+
+          echo "All pods published."
+
+      - name: Commit the SwiftPM manifest
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          # Committed only after the artifacts exist, so the manifest on the default branch always
+          # refers to a release whose archives are downloadable.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet -- Package.swift; then
+            echo "Package.swift is unchanged."
+          else
+            git add Package.swift
+            git commit -m "Release $VERSION"
+            git push
+          fi
+
+          # The tag must point at the manifest for this version, so SwiftPM resolving `exact:` gets
+          # the matching binary targets.
+          git tag -f "$TAG"
+          git push --force origin "refs/tags/$TAG"
+          echo "Tagged $TAG on the distribution repository."
+
+      - name: Verify the published release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          echo "::group::Release assets"
+          gh release view "$TAG" --json assets --jq '.assets[] | "\(.name) \(.size) bytes"'
+          echo "::endgroup::"
+
+          # Checks what a consumer actually fetches: every archive referenced by the manifest must be
+          # downloadable from the release.
+          missing=0
+          while read -r checksum archive; do
+            url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${archive}"
+            if curl -fsSL -o /dev/null "$url"; then
+              echo "✓ $archive is downloadable."
+            else
+              echo "::error::$archive is not downloadable from $url"
+              missing=$((missing + 1))
+            fi
+          done < source/artifacts/release/checksums.txt
+
+          # And every pod must be served by CocoaPods at this version.
+          for spec in source/artifacts/release/podspecs/*.podspec; do
+            pod_name="$(basename "$spec" .podspec)"
+            md5="$(printf '%s' "$pod_name" | md5 -q)"
+            spec_url="https://cdn.cocoapods.org/Specs/${md5:0:1}/${md5:1:1}/${md5:2:1}/${pod_name}/${VERSION}/${pod_name}.podspec.json"
+            if curl -fsSL -o /dev/null "$spec_url" 2>/dev/null; then
+              echo "✓ $pod_name $VERSION is served by the CocoaPods CDN."
+            elif bundle exec pod trunk info "$pod_name" 2>/dev/null | grep -q -- "- ${VERSION}"; then
+              echo "✓ $pod_name $VERSION is registered on Trunk (CDN copy still propagating)."
+            else
+              echo "::error::$pod_name $VERSION is not available from CocoaPods."
+              missing=$((missing + 1))
+            fi
+          done
+
+          [ "$missing" -eq 0 ] || exit 1
+          echo "Release $VERSION is complete and consumable from both SwiftPM and CocoaPods."
