@@ -180,25 +180,54 @@ jobs:
           echo "version=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
           echo "Releasing ${BASH_REMATCH[1]} from $TAG"
 
-      - name: Refuse to overwrite an existing release
+      # A published version must never come to mean a different binary. A release that already has its
+      # assets is therefore never rebuilt or uploaded to again: the run resumes it instead, reusing the
+      # uploaded archives to finish whatever did not complete (CocoaPods, the SwiftPM manifest, the
+      # verification). That makes a release safe to re-run after a failure past the upload.
+      - name: Detect an existing release
+        id: release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ steps.version.outputs.tag }}
         run: |
           set -euo pipefail
 
-          # A published version must never come to mean a different binary. If the release already
-          # has assets, stop: re-running is only safe before anything was uploaded.
-          if gh release view "$TAG" --json assets --jq '.assets | length' > /tmp/asset_count 2>/dev/null; then
-            count="$(cat /tmp/asset_count)"
-            if [ "$count" -gt 0 ]; then
-              echo "::error::Release $TAG already exists with $count asset(s). Publishing again would replace binaries that consumers may already have resolved. Delete the release deliberately if you intend to rebuild it."
-              exit 1
-            fi
-            echo "Release $TAG exists but has no assets; continuing."
-          else
-            echo "No existing release for $TAG."
+          if ! gh release view "$TAG" --json assets > "$RUNNER_TEMP/release.json" 2>/dev/null; then
+            echo "No existing release for $TAG; releasing from scratch."
+            echo "resume=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+
+          assets="$(jq -r '.assets[].name' "$RUNNER_TEMP/release.json")"
+          if [ -z "$assets" ]; then
+            echo "Release $TAG exists but has no assets; releasing from scratch."
+            echo "resume=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Resuming is only safe from a complete upload: every archive listed in `checksums.txt`,
+          # the CocoaPods-only archive, and `checksums.txt` itself. Anything less is not guessed at.
+          if ! grep -qxF "checksums.txt" <<< "$assets"; then
+            echo "::error::Release $TAG has assets but no checksums.txt, so it cannot be resumed. Assets: $(paste -sd ' ' - <<< "$assets")"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/existing-release"
+          gh release download "$TAG" --pattern checksums.txt --dir "$RUNNER_TEMP/existing-release" --clobber
+
+          required="$(awk '{ print $2 }' "$RUNNER_TEMP/existing-release/checksums.txt"; echo "AtatusInternal.cocoapods.zip")"
+          missing=()
+          while read -r name; do
+            [ -z "$name" ] && continue
+            grep -qxF "$name" <<< "$assets" || missing+=("$name")
+          done <<< "$required"
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Release $TAG is incomplete, so it cannot be resumed. Missing: ${missing[*]}"
+            exit 1
+          fi
+
+          echo "Release $TAG already has all $(echo "$assets" | wc -l | tr -d ' ') assets: resuming it. Nothing will be rebuilt or uploaded."
+          echo "resume=true" >> "$GITHUB_OUTPUT"
 
       - name: Clone the private source at the tag
         env:
@@ -336,6 +365,7 @@ jobs:
       # only, which `scripts/build.sh` still builds with `xcodebuild`. With Swift 6.2 it would also try to
       # compile the UIKit-only modules for macOS and fail.
       - name: Build and test the package
+        if: steps.release.outputs.resume != 'true'
         working-directory: source
         env:
           SKIP_MACOS_HOST_BUILD: "true"
@@ -385,6 +415,7 @@ jobs:
       # `build-xcframeworks.sh` (called by `build.sh`) starts with `git clean -fxd` in `source/`, which is
       # why this runs after the tests.
       - name: Build XCFrameworks
+        if: steps.release.outputs.resume != 'true'
         working-directory: source
         env:
           TAG: ${{ steps.version.outputs.tag }}
@@ -393,6 +424,7 @@ jobs:
           ./tools/release/build.sh --tag "$TAG" --artifacts-path "artifacts"
 
       - name: Validate the XCFrameworks
+        if: steps.release.outputs.resume != 'true'
         working-directory: source
         run: |
           set -euo pipefail
@@ -463,6 +495,7 @@ jobs:
           echo "All XCFrameworks carry device and simulator slices and no arm64e."
 
       - name: Package per-framework archives and checksums
+        if: steps.release.outputs.resume != 'true'
         working-directory: source
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -472,6 +505,39 @@ jobs:
             --xcframeworks-path "artifacts/Atatus.xcframework" \
             --output-path "artifacts/release" \
             --version "$VERSION"
+
+      # Resuming: the archives already published are the release. They are downloaded where this run
+      # would otherwise have built them, and checked against the published `checksums.txt`.
+      - name: Download the existing release assets
+        if: steps.release.outputs.resume == 'true'
+        working-directory: source
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p artifacts/release
+          gh release download "$TAG" --dir artifacts/release --clobber
+          cd artifacts/release
+
+          problems=0
+          while read -r checksum archive; do
+            [ -z "$archive" ] && continue
+            actual="$(shasum -a 256 "$archive" | awk '{ print $1 }')"
+            if [ "$actual" = "$checksum" ]; then
+              echo "✓ $archive matches checksums.txt"
+            else
+              echo "::error::$archive does not match checksums.txt (expected $checksum, got $actual)."
+              problems=$((problems + 1))
+            fi
+          done < checksums.txt
+          [ "$problems" -eq 0 ] || exit 1
+
+          # The podspec generator writes this archive again; the published one is kept aside and put back.
+          cp AtatusInternal.cocoapods.zip "$RUNNER_TEMP/published-AtatusInternal.cocoapods.zip"
+          echo "All published archives downloaded and verified."
 
       - name: Generate the SwiftPM manifest
         env:
@@ -495,6 +561,7 @@ jobs:
         working-directory: source
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          RESUME: ${{ steps.release.outputs.resume }}
         run: |
           set -euo pipefail
           ./tools/release/generate-binary-podspecs.sh \
@@ -502,6 +569,13 @@ jobs:
             --version "$VERSION" \
             --repository "${GITHUB_REPOSITORY}" \
             --output-path "artifacts/release/podspecs"
+
+          # Resuming: the generator has just zipped `AtatusInternal.cocoapods.zip` again. The published
+          # archive is put back, so everything below lints and verifies the bytes consumers download.
+          if [ "$RESUME" = "true" ]; then
+            cp "$RUNNER_TEMP/published-AtatusInternal.cocoapods.zip" artifacts/release/AtatusInternal.cocoapods.zip
+            echo "Kept the published AtatusInternal.cocoapods.zip."
+          fi
 
       # Every pod is linted before anything is published, against the archives this run just built,
       # without fetching anything from this repository (it is private, so CocoaPods could not).
@@ -615,6 +689,7 @@ jobs:
           echo "All podspecs validated against the built artifacts."
 
       - name: Create the GitHub release and upload artifacts
+        if: steps.release.outputs.resume != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.version.outputs.tag }}
@@ -680,10 +755,28 @@ jobs:
           # from its CDN index, which lags acceptance.
           BASE_POD="AtatusInternal"
 
+          # Whether Trunk already has this exact pod version. A published version is final, so it is
+          # skipped rather than validated and pushed again: re-running the job never republishes.
+          is_published() {
+            local pod="$1" version="$2" body
+            body="$(curl -fsS "https://trunk.cocoapods.org/api/v1/pods/$pod" 2>/dev/null)" || return 1
+            printf '%s' "$body" | python3 -c '
+          import json, sys
+          versions = [v.get("name") for v in json.load(sys.stdin).get("versions", [])]
+          sys.exit(0 if sys.argv[1] in versions else 1)' "$version"
+          }
+
+          # Extra arguments are passed to `pod trunk push` (`--synchronous` for the dependent pods).
           push_pod() {
             local spec="$1" attempt=1 output
+            shift
+            local pod="${spec%.podspec}"
+            if is_published "$pod" "$VERSION"; then
+              echo "▸ $pod $VERSION is already published on Trunk. Skipping."
+              return 0
+            fi
             while :; do
-              if output="$(bundle exec pod trunk push "$spec" --allow-warnings 2>&1)"; then
+              if output="$(bundle exec pod trunk push "$spec" --allow-warnings "$@" 2>&1)"; then
                 echo "▸ $spec published."
                 return 0
               fi
@@ -703,23 +796,31 @@ jobs:
             done
           }
 
+          # The CDN's index can lag Trunk by well over ten minutes. Either the version list or the
+          # pod's spec file being served counts as indexed.
+          CDN_TIMEOUT=2700
           wait_for_cdn() {
-            local pod="$1" version="$2" waited=0 md5 shard url
+            local pod="$1" version="$2" waited=0 md5 shard url spec_url
             md5="$(printf '%s' "$pod" | md5 -q)"
             shard="all_pods_versions_${md5:0:1}_${md5:1:1}_${md5:2:1}.txt"
             url="https://cdn.cocoapods.org/$shard"
-            echo "Waiting for $pod/$version in $shard"
-            while [ "$waited" -lt 600 ]; do
+            spec_url="https://cdn.cocoapods.org/Specs/${md5:0:1}/${md5:1:1}/${md5:2:1}/$pod/$version/$pod.podspec.json"
+            echo "Waiting for $pod/$version in $shard (up to ${CDN_TIMEOUT}s)"
+            while [ "$waited" -lt "$CDN_TIMEOUT" ]; do
               if curl -fsSL "$url" 2>/dev/null | awk -F/ -v p="$pod" -v v="$version" '
                    $1 == p { for (i = 2; i <= NF; i++) if ($i == v) found = 1 }
                    END { exit(found ? 0 : 1) }'; then
                 echo "✓ $pod/$version indexed after ${waited}s."
                 return 0
               fi
+              if curl -fsSL -o /dev/null "$spec_url" 2>/dev/null; then
+                echo "✓ $pod/$version spec served by the CDN after ${waited}s."
+                return 0
+              fi
               sleep 20
               waited=$((waited + 20))
             done
-            echo "::error::CocoaPods CDN propagation did not complete in 600s for $pod/$version. Trunk accepted it but its index has not regenerated, so dependent pods cannot validate. Re-run this job; nothing needs republishing."
+            echo "::error::CocoaPods CDN propagation did not complete in ${CDN_TIMEOUT}s for $pod/$version. Trunk accepted it but its index has not regenerated, so dependent pods cannot validate. Re-run the workflow for this version: the release is resumed and published pods are skipped."
             return 1
           }
 
@@ -735,7 +836,9 @@ jobs:
           for spec in *.podspec; do
             [ "$spec" = "$BASE_POD.podspec" ] && continue
             echo "::group::Publish $spec"
-            push_pod "$spec" || FAILED_PODS+=("$spec")
+            # `--synchronous` validates against Trunk's own spec repository, so a dependency pushed
+            # moments ago resolves even if the CDN has not caught up.
+            push_pod "$spec" --synchronous || FAILED_PODS+=("$spec")
             echo "::endgroup::"
           done
 
