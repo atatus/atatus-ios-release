@@ -335,30 +335,15 @@ jobs:
       # The macOS host `swift build` in `scripts/build.sh` is skipped: the release ships iOS and tvOS
       # only, which `scripts/build.sh` still builds with `xcodebuild`. With Swift 6.2 it would also try to
       # compile the UIKit-only modules for macOS and fail.
-      # Tests run on an iOS 18.6 simulator rather than the newest one: SessionReplay's SwiftUI image
-      # capture and image scaling behave differently from iOS 26 on, which three of its tests catch, and
-      # is tracked as separate SDK work. Everything else would pass on either.
       - name: Build and test the package
         working-directory: source
         env:
           SKIP_MACOS_HOST_BUILD: "true"
-          TEST_SIMULATOR_RUNTIME: com.apple.CoreSimulator.SimRuntime.iOS-18-6
-          TEST_SIMULATOR_DEVICE: iPhone 16
         run: |
           set -euo pipefail
           ./scripts/validate_spm.sh
           ./scripts/build.sh
-
-          # A simulator of our own, so the run does not depend on which devices the runner image ships.
-          if ! xcrun simctl list runtimes | grep -qF "$TEST_SIMULATOR_RUNTIME"; then
-            echo "::error::CI environment: the simulator runtime $TEST_SIMULATOR_RUNTIME is not installed on this runner."
-            xcrun simctl list runtimes
-            exit 1
-          fi
-          simulator_id="$(xcrun simctl create "Release tests" "$TEST_SIMULATOR_DEVICE" "$TEST_SIMULATOR_RUNTIME")"
-          echo "Testing on $TEST_SIMULATOR_DEVICE ($TEST_SIMULATOR_RUNTIME): $simulator_id"
-
-          IOS_TEST_DESTINATION="platform=iOS Simulator,id=$simulator_id" ./scripts/test.sh
+          ./scripts/test.sh
 
       # Built from `source/`, the clone of the private repository at the tag. `build.sh` leaves the
       # arm64e-free bundle in `artifacts/Atatus.xcframework`, which the steps below validate and package.
