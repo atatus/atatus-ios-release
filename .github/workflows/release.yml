@@ -300,8 +300,13 @@ jobs:
             bundle install
           fi
 
+      # The macOS host `swift build` in `scripts/build.sh` is skipped: the release ships iOS and tvOS
+      # only, which `scripts/build.sh` still builds with `xcodebuild`. With Swift 6.2 it would also try to
+      # compile the UIKit-only modules for macOS and fail.
       - name: Build and test the package
         working-directory: source
+        env:
+          SKIP_MACOS_HOST_BUILD: "true"
         run: |
           set -euo pipefail
           ./scripts/validate_spm.sh
