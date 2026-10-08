@@ -861,10 +861,12 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          if git diff --quiet -- Package.swift; then
+          # Staged first: `git diff` alone ignores an untracked file, which `Package.swift` is on the
+          # first release, and reported it as unchanged.
+          git add Package.swift
+          if git diff --cached --quiet -- Package.swift; then
             echo "Package.swift is unchanged."
           else
-            git add Package.swift
             git commit -m "Release $VERSION"
             git push
           fi
@@ -914,6 +916,24 @@ jobs:
               missing=$((missing + 1))
             fi
           done
+
+          # And the tag must carry a manifest that names this version's archives, or SwiftPM resolves
+          # nothing: the first release ended with a tag on a commit without `Package.swift`.
+          echo "::group::SwiftPM manifest at $TAG"
+          if ! git show "${TAG}:Package.swift" > "$RUNNER_TEMP/Package.swift" 2>/dev/null; then
+            echo "::error::$TAG has no Package.swift; SwiftPM cannot resolve this version."
+            missing=$((missing + 1))
+          else
+            while read -r checksum archive; do
+              if grep -qF "$checksum" "$RUNNER_TEMP/Package.swift"; then
+                echo "✓ $archive is referenced by the manifest at $TAG."
+              else
+                echo "::error::The manifest at $TAG does not reference $archive (checksum $checksum)."
+                missing=$((missing + 1))
+              fi
+            done < source/artifacts/release/checksums.txt
+          fi
+          echo "::endgroup::"
 
           [ "$missing" -eq 0 ] || exit 1
           echo "Release $VERSION is complete and consumable from both SwiftPM and CocoaPods."
