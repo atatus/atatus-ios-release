@@ -15,9 +15,13 @@
 
 name: Release
 
-# Scheduled runs only look for tags; each release is a run of its own, named after its version, so
-# `detect` can tell from the run history which versions were already attempted.
-run-name: ${{ github.event_name == 'schedule' && 'Detect release tags' || format('Release {0}', inputs.version) }}
+# Scheduled runs only look for tags; each release is a run of its own, named after its version and,
+# when `detect` started it, the tag's commit. That is how `detect` tells from the run history which
+# commit of a tag was already attempted.
+run-name: >-
+  ${{ github.event_name == 'schedule' && 'Detect release tags'
+  || (inputs.commit != '' && format('Release {0} @ {1}', inputs.version, inputs.commit))
+  || format('Release {0}', inputs.version) }}
 
 on:
   schedule:
@@ -30,6 +34,11 @@ on:
         description: "Release tag from the private repository, e.g. v1.0.0"
         type: string
         required: true
+      commit:
+        description: "Commit the tag must point at (set by the scheduled detection; leave empty)"
+        type: string
+        required: false
+        default: ""
 
 # Each job declares the little it needs.
 permissions: {}
@@ -81,13 +90,23 @@ jobs:
           ASKPASS
           chmod 700 "$RUNNER_TEMP/git-askpass.sh"
 
+          # Without `--refs`, so an annotated tag also lists the commit it points at (`<tag>^{}`).
           refs="$(GIT_ASKPASS="$RUNNER_TEMP/git-askpass.sh" GIT_TERMINAL_PROMPT=0 \
-            git ls-remote --tags --refs "https://bitbucket.org/${BITBUCKET_REPOSITORY}.git")"
+            git ls-remote --tags "https://bitbucket.org/${BITBUCKET_REPOSITORY}.git")"
           rm -f "$RUNNER_TEMP/git-askpass.sh"
 
           # Production tags only, oldest first, so versions are released in order.
           tags="$(printf '%s\n' "$refs" | awk '{ sub("^refs/tags/", "", $2); print $2 }' \
             | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sort -V)"
+
+          # The commit a tag points at: the peeled `^{}` entry for an annotated tag, the ref itself
+          # for a lightweight one. Shortened to keep run names readable.
+          tag_commit() {
+            local sha
+            sha="$(printf '%s\n' "$refs" | awk -v r="refs/tags/$1^{}" '$2 == r { print $1 }')"
+            [ -n "$sha" ] || sha="$(printf '%s\n' "$refs" | awk -v r="refs/tags/$1" '$2 == r { print $1 }')"
+            printf '%s' "${sha:0:10}"
+          }
           if [ -z "$tags" ]; then
             echo "No vX.Y.Z tags in ${BITBUCKET_REPOSITORY}."
             exit 0
@@ -114,17 +133,19 @@ jobs:
               continue
             fi
 
-            # A tag whose release run failed before creating the GitHub release is not retried
-            # automatically: the failure needs a fix, and retrying would only repeat it every 15
-            # minutes on a macOS runner.
-            previous="$(printf '%s\n' "$runs" | awk -F '\t' -v t="Release $tag" '$1 == t { print $3; exit }')"
+            commit="$(tag_commit "$tag")"
+
+            # Each commit of a tag is attempted once. A run that failed is retried automatically only
+            # after the tag is moved to a new commit (fix, commit, re-tag): retrying the same commit
+            # would only repeat the failure every 15 minutes on a macOS runner.
+            previous="$(printf '%s\n' "$runs" | awk -F '\t' -v t="Release $tag @ $commit" '$1 == t { print $3; exit }')"
             if [ -n "$previous" ]; then
-              echo "::warning::$tag has no GitHub release, and its last release run ended '$previous'. It is not retried automatically: fix the cause, then run this workflow manually with version $tag."
+              echo "::warning::$tag at $commit has no GitHub release, and its release run ended '$previous'. Fix the cause and move the tag to a new commit; it is then released automatically."
               continue
             fi
 
-            echo "Dispatching the release of $tag."
-            gh workflow run "$WORKFLOW_FILE" --ref "$GITHUB_REF_NAME" -f version="$tag"
+            echo "Dispatching the release of $tag at $commit."
+            gh workflow run "$WORKFLOW_FILE" --ref "$GITHUB_REF_NAME" -f version="$tag" -f commit="$commit"
             exit 0
           done
 
@@ -183,6 +204,7 @@ jobs:
         env:
           BITBUCKET_APP_PASSWORD: ${{ secrets.BITBUCKET_APP_PASSWORD }}
           TAG: ${{ steps.version.outputs.tag }}
+          EXPECTED_COMMIT: ${{ inputs.commit }}
         run: |
           set -euo pipefail
 
@@ -214,6 +236,16 @@ jobs:
 
           echo "Cloned ${BITBUCKET_REPOSITORY} at $TAG"
           git -C source log --oneline -1
+
+          # A run started by `detect` builds exactly the commit it was started for. If the tag has
+          # moved since, this run stops and the next `detect` starts one for the new commit.
+          if [ -n "$EXPECTED_COMMIT" ]; then
+            actual="$(git -C source rev-parse HEAD)"
+            if [[ "$actual" != "$EXPECTED_COMMIT"* ]]; then
+              echo "::error::$TAG now points at ${actual:0:10}, not $EXPECTED_COMMIT. The scheduled detection will release the new commit."
+              exit 1
+            fi
+          fi
 
       - name: Verify the source version matches the tag
         env:
