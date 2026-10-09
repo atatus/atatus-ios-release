@@ -25,9 +25,10 @@ run-name: >-
 
 on:
   schedule:
-    # GitHub may start scheduled runs late under load, so a release begins roughly 15-30 minutes
+    # Every 5 minutes, GitHub's shortest schedule: pushing a tag is the whole trigger. GitHub may still
+    # start scheduled runs late under load, so a release can begin anywhere from minutes to hours
     # after its tag is pushed.
-    - cron: "*/15 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       version:
@@ -137,7 +138,7 @@ jobs:
 
             # Each commit of a tag is attempted once. A run that failed is retried automatically only
             # after the tag is moved to a new commit (fix, commit, re-tag): retrying the same commit
-            # would only repeat the failure every 15 minutes on a macOS runner.
+            # would only repeat the failure every few minutes on a macOS runner.
             previous="$(printf '%s\n' "$runs" | awk -F '\t' -v t="Release $tag @ $commit" '$1 == t { print $3; exit }')"
             if [ -n "$previous" ]; then
               echo "::warning::$tag at $commit has no GitHub release, and its release run ended '$previous'. Fix the cause and move the tag to a new commit; it is then released automatically."
@@ -287,7 +288,7 @@ jobs:
           # would publish artifacts whose reported version disagrees with their package version.
           sdk_version="$(grep '__sdkVersion' AtatusCore/Sources/Versioning.swift | awk -F '"' '{print $2}')"
           if [ "$sdk_version" != "$VERSION" ]; then
-            echo "::error::__sdkVersion is '$sdk_version' but the tag says '$VERSION'."
+            echo "::error::__sdkVersion is '$sdk_version' but the tag says '$VERSION'. The version was not bumped before tagging: run 'make bump' (enter $VERSION), commit, push, then delete and re-push the tag on that commit."
             exit 1
           fi
 
